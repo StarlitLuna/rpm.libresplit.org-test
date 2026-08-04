@@ -1,6 +1,6 @@
 [libresplit]
 name=LibreSplit
-baseurl=https://rpm.libresplit.org/stable/$basearch/
+baseurl=https://starlitluna.github.io/rpm.libresplit.org-test/stable/$basearch/
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1

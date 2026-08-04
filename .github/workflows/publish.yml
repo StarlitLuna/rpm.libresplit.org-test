@@ -38,7 +38,7 @@ concurrency:
 
 env:
   PAGES_LIMIT_BYTES: "943718400"
-  UPSTREAM_REPOSITORY: LibreSplit/LibreSplit
+  UPSTREAM_REPOSITORY: StarlitLuna/LibreSplit-test
 
 jobs:
   publish:
@@ -66,10 +66,10 @@ jobs:
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: LibreSplit
+          owner: StarlitLuna
           repositories: |
-            LibreSplit
-            rpm.libresplit.org
+            LibreSplit-test
+            rpm.libresplit.org-test
           permission-administration: write
           permission-contents: write
           permission-pages: write
