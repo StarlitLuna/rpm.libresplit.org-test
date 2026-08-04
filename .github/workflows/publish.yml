@@ -1,0 +1,512 @@
+name: Publish RPM repository
+
+run-name: LibreSplit ${{ inputs.version }}-${{ inputs.rpm_release }} from ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: ID of the LibreSplit draft release
+        required: true
+        type: string
+      version:
+        description: LibreSplit version MAJOR.MINOR.PATCH
+        required: true
+        type: string
+      rpm_release:
+        description: RPM release number for this LibreSplit version
+        required: true
+        type: string
+      source_sha:
+        description: LibreSplit source commit hash from main
+        required: true
+        type: string
+      packaging_sha:
+        description: RPM commit hash used for both RPM builds
+        required: true
+        type: string
+      origin_run_id:
+        description: ID of the initiating LibreSplit workflow run
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: libresplit-rpm
+  queue: max
+
+env:
+  PAGES_LIMIT_BYTES: "943718400"
+  UPSTREAM_REPOSITORY: LibreSplit/LibreSplit
+
+jobs:
+  publish:
+    name: Sign and publish RPMs
+    runs-on: ubuntu-24.04
+    container: registry.fedoraproject.org/fedora:44
+    environment: production
+    steps:
+      - name: Install Fedora tooling
+        run: >-
+          dnf install --assumeyes
+          createrepo_c
+          curl
+          findutils
+          git
+          gh
+          gnupg2
+          jq
+          rpm-build
+          rpm-sign
+
+      - name: Create publication token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: LibreSplit
+          repositories: |
+            LibreSplit
+            rpm.libresplit.org
+          permission-administration: write
+          permission-contents: write
+          permission-pages: write
+          permission-workflows: write
+
+      - name: Read release state
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          release_json="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/${RELEASE_ID}"
+          )"
+
+          if [[ "$(jq -r '.draft' <<<"${release_json}")" != "true" ]]; then
+            echo "published=true" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          jq '.assets' <<<"${release_json}" >"${RUNNER_TEMP}/release-assets.json"
+          echo "published=false" >>"${GITHUB_OUTPUT}"
+
+      - name: Check out packaging policy
+        if: steps.release.outputs.published != 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ref: ${{ inputs.packaging_sha }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Import online signing subkey
+        if: steps.release.outputs.published != 'true'
+        env:
+          RPM_SIGNING_SUBKEY_BASE64: ${{ secrets.RPM_SIGNING_SUBKEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          public_key="${GITHUB_WORKSPACE}/packaging/RPM-GPG-KEY-libresplit"
+          test -s "${public_key}"
+
+          signing_home="${RUNNER_TEMP}/signing-gnupg"
+          verification_home="${RUNNER_TEMP}/verification-gnupg"
+          install -d -m 0700 "${signing_home}" "${verification_home}"
+          gpg --batch --homedir "${signing_home}" --import "${public_key}"
+          printf '%s' "${RPM_SIGNING_SUBKEY_BASE64}" |
+            base64 --decode |
+            gpg --batch --homedir "${signing_home}" --import
+          gpg --batch --homedir "${verification_home}" --import "${public_key}"
+
+          signing_fingerprint="$(
+            gpg --batch --homedir "${signing_home}" --with-colons \
+              --list-secret-keys |
+              awk -F: '
+                $1 == "ssb" { usable = ($15 == "+"); next }
+                usable && $1 == "fpr" { print $10; exit }
+              '
+          )"
+
+          if [[ -z "${signing_fingerprint}" ]]; then
+            echo "The signing subkey is empty." >&2
+            exit 1
+          fi
+
+          {
+            echo "GNUPGHOME=${signing_home}"
+            echo "SIGNING_FINGERPRINT=${signing_fingerprint}"
+            echo "VERIFICATION_GNUPGHOME=${verification_home}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Sign or reuse release RPMs
+        if: steps.release.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RPM_RELEASE: ${{ inputs.rpm_release }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          assets_json="${RUNNER_TEMP}/release-assets.json"
+          final_dir="${RUNNER_TEMP}/final-rpms"
+          rpm_db="${RUNNER_TEMP}/rpmdb"
+          install -d "${final_dir}" "${rpm_db}"
+          rpmkeys --dbpath "${rpm_db}" --import packaging/RPM-GPG-KEY-libresplit
+
+          download_asset() {
+            local asset_id="$1"
+            local destination="$2"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/assets/${asset_id}" \
+              >"${destination}"
+          }
+
+          verify_download() {
+            local path="$1"
+            local expected_digest="$2"
+            local actual_digest
+            actual_digest="sha256:$(sha256sum "${path}" | awk '{ print $1 }')"
+            if [[ "${actual_digest}" != "${expected_digest}" ]]; then
+              echo "GitHub asset digest mismatch for $(basename "${path}")." >&2
+              return 1
+            fi
+            rpm -qp --nosignature --queryformat '%{NAME}\n' "${path}" >/dev/null
+          }
+
+          verify_signed_rpm() {
+            local path="$1"
+            local signature verification
+            signature="$(
+              rpm -qp --queryformat \
+                '%{SIGPGP:pgpsig}|%{SIGGPG:pgpsig}|%{RSAHEADER:pgpsig}|%{DSAHEADER:pgpsig}' \
+                "${path}"
+            )"
+            if [[ "${signature}" == "(none)|(none)|(none)|(none)" ]]; then
+              echo "$(basename "${path}") is not signed." >&2
+              return 1
+            fi
+            verification="$(
+              rpmkeys --dbpath "${rpm_db}" --checksig --verbose "${path}" 2>&1
+            )"
+
+            if grep -Eqi 'NOKEY|NOT OK' <<<"${verification}"; then
+              echo "${verification}" >&2
+              return 1
+            fi
+          }
+
+          complete_signed_pair=true
+          for architecture in x86_64 aarch64; do
+            final_name="libresplit-${VERSION}-${RPM_RELEASE}.${architecture}.rpm"
+            mapfile -t final_assets < <(
+              jq -r --arg name "${final_name}" \
+                '.[] | select(.name == $name) |
+                 [.id, .state, .size, (.digest // "")] | @tsv' \
+                "${assets_json}"
+            )
+
+            if [[ "${#final_assets[@]}" -ne 1 ]]; then
+              complete_signed_pair=false
+              continue
+            fi
+
+            IFS=$'\t' read -r _id state size digest <<<"${final_assets[0]}"
+            if [[ "${state}" != "uploaded" || "${size}" -le 0 || ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              complete_signed_pair=false
+            fi
+          done
+
+          if [[ "${complete_signed_pair}" != "true" ]]; then
+            for architecture in x86_64 aarch64; do
+              final_name="libresplit-${VERSION}-${RPM_RELEASE}.${architecture}.rpm"
+              while IFS= read -r asset_id; do
+                gh api --method DELETE \
+                  -H "X-GitHub-Api-Version: 2026-03-10" \
+                  "repos/${UPSTREAM_REPOSITORY}/releases/assets/${asset_id}"
+              done < <(
+                jq -r --arg name "${final_name}" '.[] | select(.name == $name) | .id' "${assets_json}"
+              )
+            done
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+              >"${assets_json}"
+          fi
+
+          for architecture in x86_64 aarch64; do
+            final_name="libresplit-${VERSION}-${RPM_RELEASE}.${architecture}.rpm"
+            final_path="${final_dir}/${final_name}"
+
+            if [[ "${complete_signed_pair}" == "true" ]]; then
+              IFS=$'\t' read -r asset_id _state _size digest < <(
+                jq -r --arg name "${final_name}" \
+                  '.[] | select(.name == $name) |
+                   [.id, .state, .size, .digest] | @tsv' "${assets_json}"
+              )
+
+              download_asset "${asset_id}" "${final_path}"
+              verify_download "${final_path}" "${digest}"
+              verify_signed_rpm "${final_path}"
+              continue
+            fi
+
+            unsigned_name="libresplit-${VERSION}-${RPM_RELEASE}.${architecture}.unsigned.rpm"
+            mapfile -t unsigned_assets < <(
+              jq -r --arg name "${unsigned_name}" \
+                '.[] | select(.name == $name) |
+                 [.id, .state, .size, (.digest // "")] | @tsv' \
+                "${assets_json}"
+            )
+
+            if [[ "${#unsigned_assets[@]}" -ne 1 ]]; then
+              echo "The draft must contain one ${unsigned_name}." >&2
+              exit 1
+            fi
+
+            IFS=$'\t' read -r asset_id state size digest <<<"${unsigned_assets[0]}"
+            if [[ "${state}" != "uploaded" || "${size}" -le 0 || ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "The ${unsigned_name} upload is incomplete." >&2
+              exit 1
+            fi
+
+            unsigned_path="${RUNNER_TEMP}/${unsigned_name}"
+            download_asset "${asset_id}" "${unsigned_path}"
+            verify_download "${unsigned_path}" "${digest}"
+            cp "${unsigned_path}" "${final_path}"
+            rpmsign --addsign \
+              --define "_gpg_name ${SIGNING_FINGERPRINT}!" \
+              --define "_gpg_path ${GNUPGHOME}" \
+              "${final_path}"
+            verify_signed_rpm "${final_path}"
+
+            upload_response="$(
+              curl --fail-with-body --silent --show-error \
+                --request POST \
+                -H 'Accept: application/vnd.github+json' \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H 'Content-Type: application/octet-stream' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                --data-binary "@${final_path}" \
+                "https://uploads.github.com/repos/${UPSTREAM_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${final_name}"
+            )"
+
+            uploaded_digest="$(jq -r '.digest // ""' <<<"${upload_response}")"
+            expected_digest="sha256:$(
+              sha256sum "${final_path}" | awk '{ print $1 }'
+            )"
+
+            if [[ "${uploaded_digest}" != "${expected_digest}" ]]; then
+              echo "GitHub asset digest mismatch after uploading ${final_name}." >&2
+              exit 1
+            fi
+          done
+
+          echo "FINAL_RPM_DIR=${final_dir}" >>"${GITHUB_ENV}"
+
+      - name: Update and publish RPM repository
+        if: steps.release.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          PACKAGING_SHA: ${{ inputs.packaging_sha }}
+          RPM_RELEASE: ${{ inputs.rpm_release }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          pages_dir="${RUNNER_TEMP}/pages-worktree"
+          if remote_pages="$(git ls-remote --heads origin gh-pages)" && [[ -n "${remote_pages}" ]]; then
+            git fetch --no-tags --depth=1 origin "refs/heads/gh-pages:refs/remotes/origin/gh-pages"
+            git worktree add -B gh-pages "${pages_dir}" refs/remotes/origin/gh-pages
+          else
+            git worktree add --detach "${pages_dir}" HEAD
+            git -C "${pages_dir}" switch --orphan gh-pages
+            git -C "${pages_dir}" rm -r --ignore-unmatch .
+          fi
+
+          install -d "${pages_dir}/stable/x86_64" "${pages_dir}/stable/aarch64"
+          candidate_evr="${VERSION}-${RPM_RELEASE}"
+          mapfile -t published_evrs < <(
+            find "${pages_dir}/stable/x86_64" -maxdepth 1 -type f \
+              -name 'libresplit-*.x86_64.rpm' -printf '%f\n' |
+              sed -E 's/^libresplit-(.+)\.x86_64\.rpm$/\1/' |
+              sort -V
+          )
+
+          if [[ "${#published_evrs[@]}" -gt 0 ]]; then
+            current_evr="${published_evrs[-1]}"
+            if [[ "${candidate_evr}" != "${current_evr}" &&
+                  "$(printf '%s\n' "${current_evr}" "${candidate_evr}" |
+                    sort -V | tail -n 1)" != "${candidate_evr}" ]]; then
+              echo "${candidate_evr} is older than published ${current_evr}." >&2
+              exit 1
+            fi
+          fi
+
+          : >"${pages_dir}/.nojekyll"
+          printf '%s\n' 'rpm.libresplit.org' >"${pages_dir}/CNAME"
+          cp packaging/libresplit.repo "${pages_dir}/libresplit.repo"
+          cp packaging/RPM-GPG-KEY-libresplit "${pages_dir}/RPM-GPG-KEY-libresplit"
+          for architecture in x86_64 aarch64; do
+            final_name="libresplit-${candidate_evr}.${architecture}.rpm"
+            cp "${FINAL_RPM_DIR}/${final_name}" "${pages_dir}/stable/${architecture}/${final_name}"
+            cp "${FINAL_RPM_DIR}/${final_name}" "${pages_dir}/libresplit.${architecture}.rpm"
+          done
+
+          regenerate_metadata() {
+            local architecture metadata signature
+            for architecture in x86_64 aarch64; do
+              createrepo_c --quiet --update --simple-md-filenames "${pages_dir}/stable/${architecture}"
+              metadata="${pages_dir}/stable/${architecture}/repodata/repomd.xml"
+              signature="${metadata}.asc"
+              rm -f "${signature}"
+              gpg --batch --yes --armor --detach-sign \
+                --homedir "${GNUPGHOME}" \
+                --pinentry-mode loopback --passphrase '' \
+                --local-user "${SIGNING_FINGERPRINT}!" \
+                --output "${signature}" "${metadata}"
+            done
+          }
+
+          regenerate_metadata
+          while :; do
+            site_bytes="$(
+              find "${pages_dir}" \
+                -path "${pages_dir}/.git" -prune -o \
+                -type f -printf '%s\n' |
+                awk '{ total += $1 } END { print total + 0 }'
+            )"
+
+            if [[ "${site_bytes}" -lt "${PAGES_LIMIT_BYTES}" ]]; then
+              break
+            fi
+
+            mapfile -t retained_evrs < <(
+              find "${pages_dir}/stable/x86_64" -maxdepth 1 -type f \
+                -name 'libresplit-*.x86_64.rpm' -printf '%f\n' |
+                sed -E 's/^libresplit-(.+)\.x86_64\.rpm$/\1/' |
+                sort -V
+            )
+
+            oldest_evr="${retained_evrs[0]}"
+            rm -f \
+              "${pages_dir}/stable/x86_64/libresplit-${oldest_evr}.x86_64.rpm" \
+              "${pages_dir}/stable/aarch64/libresplit-${oldest_evr}.aarch64.rpm"
+            regenerate_metadata
+          done
+
+          for architecture in x86_64 aarch64; do
+            metadata="${pages_dir}/stable/${architecture}/repodata/repomd.xml"
+            gpg --batch --homedir "${VERIFICATION_GNUPGHOME}" --verify "${metadata}.asc" "${metadata}"
+          done
+
+          git -C "${pages_dir}" add -A
+          if ! git -C "${pages_dir}" diff --cached --quiet; then
+            git -C "${pages_dir}" \
+              -c user.name='LibreSplit release automation' \
+              -c user.email='noreply@libresplit.org' \
+              commit \
+                -m "Publish LibreSplit ${candidate_evr}" \
+                -m "Source: ${SOURCE_SHA}" \
+                -m "Origin run: ${ORIGIN_RUN_ID}" \
+                -m "Packaging: ${PACKAGING_SHA}"
+            git -C "${pages_dir}" push origin HEAD:gh-pages
+          fi
+
+          published_sha="$(git -C "${pages_dir}" rev-parse HEAD)"
+          pages_json="${RUNNER_TEMP}/pages.json"
+          pages_status="$(
+            curl --location --silent --show-error \
+              --output "${pages_json}" \
+              --write-out '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/pages"
+          )"
+
+          case "${pages_status}" in
+            200)
+              ;;
+            404)
+              jq -n '{source: {branch: "gh-pages", path: "/"}}' |
+                gh api --method POST \
+                  -H "X-GitHub-Api-Version: 2026-03-10" \
+                  "repos/${GITHUB_REPOSITORY}/pages" --input - >/dev/null
+              ;;
+            *)
+              echo "GitHub Pages lookup failed with HTTP ${pages_status}." >&2
+              exit 1
+              ;;
+          esac
+
+          pages_ready=false
+          for attempt in $(seq 1 60); do
+            build_json="$(
+              gh api \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/${GITHUB_REPOSITORY}/pages/builds/latest" \
+                2>/dev/null || true
+            )"
+            if [[ -n "${build_json}" && "$(jq -r '.commit // ""' <<<"${build_json}")" == "${published_sha}" ]]; then
+              case "$(jq -r '.status // ""' <<<"${build_json}")" in
+                built)
+                  pages_ready=true
+                  break
+                  ;;
+                errored)
+                  jq -r '.error.message // "GitHub Pages build failed."' <<<"${build_json}" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            echo "Waiting for Pages build (${attempt}/60)."
+            sleep 10
+          done
+
+          if [[ "${pages_ready}" != "true" ]]; then
+            echo "Timed out waiting for Pages commit ${published_sha}." >&2
+            exit 1
+          fi
+
+      - name: Publish stable release
+        if: steps.release.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_ID: ${{ inputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          assets_json="$(
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100"
+          )"
+
+          while IFS= read -r asset_id; do
+            gh api --method DELETE \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/assets/${asset_id}"
+
+          done < <(
+            jq -r '.[] | select(.name | endswith(".unsigned.rpm")) | .id' \
+              <<<"${assets_json}"
+          )
+
+          jq -n '{draft: false, make_latest: "true"}' |
+            gh api --method PATCH \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${UPSTREAM_REPOSITORY}/releases/${RELEASE_ID}" \
+              --input - >/dev/null
