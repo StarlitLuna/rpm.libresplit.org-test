@@ -326,6 +326,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
           pages_dir="${RUNNER_TEMP}/pages-worktree"
           if remote_pages="$(git ls-remote --heads origin gh-pages)" && [[ -n "${remote_pages}" ]]; then
             git fetch --no-tags --depth=1 origin "refs/heads/gh-pages:refs/remotes/origin/gh-pages"
@@ -356,7 +358,7 @@ jobs:
           fi
 
           : >"${pages_dir}/.nojekyll"
-          printf '%s\n' 'rpm.libresplit.org' >"${pages_dir}/CNAME"
+          rm -f "${pages_dir}/CNAME"
           cp packaging/libresplit.repo "${pages_dir}/libresplit.repo"
           cp packaging/RPM-GPG-KEY-libresplit "${pages_dir}/RPM-GPG-KEY-libresplit"
           for architecture in x86_64 aarch64; do
